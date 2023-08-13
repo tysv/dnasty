@@ -1,0 +1,170 @@
+#!/bin/env bash
+
+debugflag=true; first_time_setup=""
+scriptname="$(basename "$0")"
+clientdir="$HOME/server" #the host files the device pulls from auth servers
+serverdir="$HOME/server" #the host files the device has auth over
+logdir="$HOME/logs"
+logfile="${configdir}log"
+if [ -n "$first_time_setup" ]; then 
+	mkdir --parents "$configdir" && touch "$configfile"; 
+	mkdir --parents "$logdir" && touch "$logfile";
+fi
+
+#########################   utility functions   ################################
+
+exiting () { echo "exiting from $scriptname"; }
+trap 'exiting' EXIT ERR
+logger () { printf "%s\n" "$@" >> "$logfile"; }
+debug () { if [ "$debugflag" = "true" ]; then echo "$*"; fi; }
+error () { printf "error:$0: %s\n" "$1"; exit "${2:-1}"; }
+print_help_text () { printf "%s\n" "\
+$(strbuilts --center "\
+$scriptname USAGE: $scriptname <-(-o)ptions> <args>")
+Options include:
+	-(-h)elp	will print this text
+$(strbuilts --line)
+"
+}
+#if you are the root authority for any *.hosts file, we prepare the files
+update_auth_lists () {
+	filelist="$(find -type f -name '*.auth')"
+	for file in "${filelist[@]}"; do [ -f "$file" ] || continue
+		x="$(cat "$file")"
+		[ "$x" = "localhost" -o "$x" = "127.0.0.1" ] || continue
+		netID="$(basename ${file%.*})" 		#gets rid of file suffix
+	#	netID="${netID//*\/}"	#gets rid of any lingering filepath
+		localcopy "$netID.hosts" 1>&2> /dev/null
+		md5sum "$file" > "$netID.checksum"
+	done
+}
+proceed_check () { #N=return1 Y=Return0 Q=Exit0
+	messages=();	while [ "$1" ]; do messages+=("$1"); shift; done
+	printf "%s\n" "${messages[@]}"
+	while true; do read -rp 'Proceed? (y/n/q):> ' choice; c="${choice[*]:0:1}"
+		case "$c" in y|Y) return 0; ;; n|N) return 1; ;; q|Q) exit 0; ;; esac
+	done
+}
+
+########################        FUNCTIONS        ###############################
+localcopy () { # version modified from .bash_functions 8/11/23
+    shopt -s dotglob; shopt -s nullglob; dir="$PWD"
+    if [ "$1" = "--dir" -o "$1" = "-d" ]; then
+        directory="$(realpath $2)";
+        [ -d "$directory" ] && { dir="$directory"; shift 2; } || return 1;
+    fi
+    for file in "$@"; do
+        if [ -f "$file" ]; then
+            if [ "${file[@]:0:1}" = '.' ]; then optionalDot=''
+            else optionalDot='.'
+            fi
+            filename="$(basename $file)";
+            copyname="${dir}/${optionalDot}${filename}_old";
+            IFS=' ';
+            numcopies=("${copyname}"*);
+            suffix="$(( ${#numcopies[@]} + 1 ))";
+            last_suffix="${#numcopies[@]}";
+            
+            while [ -f "${copyname}${suffix}" ]; do
+                suffix="$(( suffix + 1 ))";
+            done
+            diff -qN "${copyname}$last_suffix" "$file" 1>&2 > /dev/null
+            if [ "$?" -eq 0 ]; then return 0
+            else cp -i "$file" "${copyname}$suffix"
+            fi
+        fi
+    done
+}
+#concatonates current .hosts into a unified /etc/hosts format file and prints filename
+create_host_file () {
+	result="new_$(date +%s).conf"
+	touch "$result"
+	[ -d "$1" ] || error "create_host_file(): \$1 must equal valid dirname."
+	files=($(find . -name '*.hosts'))
+	for file in "${files[@]}"; do
+		network="$(basename ${file%.*})"
+		echo "# $network-hosts:" >> "$result"
+		cat "$file" >> "$result"
+		echo $'\n' >> "$result"
+	done
+	printf "%s" "$(realpath $result)"
+}
+pull_remote_filetype () {
+	[ "$#" -ge 2 -a "$#" -le 3 ] || error "ARGS: target IP, download suffix, (whereto save)"
+	user="dnasty"; address="$1"; suffix="$2"; save_to="${3:-./}"
+	scp "$user@$address":'*.'"$suffix" ./
+}
+pull_remote_file () {
+	[ "$#" -eq 2 ] || error "ARGS: target IP & target FILENAME (& whereto SAVE)"
+	user="tsv"; address="$1"; filename="$2"; save_to="${3:-./}"
+	#scp "$user@$address:$filename" #assume flat dnasty folder
+	debug "trying scp... user=$user address=$address filename=$filename"
+	scp "$user@$address:/home/tsv/dnasty/$filename" ./
+}
+try_ping () { [ "$1" ] || error "provide IP address."
+	ping -c2 -W .5 "$1" 1>&2 > /dev/null; return "$?"
+}
+pull_root_servers () {
+	files=($(find . -name '*.auth'))
+	new_files=()
+	for file in "${files[@]}"; do
+		network="$(basename ${file%.*})"
+		address="$(cat "$file")"
+		try_ping "$address" || { logger "failed ping: $network" && continue; }
+		pull_remote_file "$address" "$network.checksum"
+		[ ! "$?" -eq 0 ] && { logger "failed checksum pull: $network" && continue; }
+		md5sum "$network.checksum" --check --quiet 1>&2 > /dev/null && continue
+		[ -f "$network.hosts" ] && localcopy "$network.hosts" 
+		pull_remote_file "$address" "$network.hosts"
+		logger "New host file pulled for networkID: $network"
+	done
+}
+import_dnasty_configuration () { 
+	echo "unimplemented, but basically:"
+	echo "give a file perfect for calling declare on??? probably?"
+}
+install_dnasty () { [ -f "$1" ] && { import_dnasty_configuration; exit 1; }
+	#get sudo
+	#check for user dnasty, and prompt to start over if present already
+	#create CLIENT and SERVER folders in home directory
+	#copy this script into the home directory
+	#prompt for client or server installation
+
+	#CLIENT_MODE specific steps
+	#SERVER_MODE specific steps
+	
+	#unsorted
+	#create cronjob for PULLing auth scripts from other computers
+	#create cronjob for UPDATing .host files when we are AUTH SERVERS
+	#create example files for both: fake.hosts, fake.auth, fake.checksum
+	#create readme files for both??
+	#configure ssh to allow ssh-copy-id, or sftp jail?? to allow passwd auth on upload
+	#
+}
+
+
+
+#########################     option parsing     ###############################
+
+#this is awoken by a cronjob, or manually run i suppose
+pull_root_servers
+
+exit 0
+shopt -s nocasematch; positionals=()
+while [ -n "$1" ]; do
+	case "$1" in
+		--help|-h) print_help_texts; ;;
+		--update-auth-lists|-u|--update) update_auth_lists; ;;
+		--pull-auth-lists|-p|--pull) pull_root_servers
+		--install|-i|--setup) install_dnasty; ;;
+		*) positionals+=("$1"); ;;
+	esac
+	shift
+done
+shopt -u nocasematch; set -- "${positionals[@]}"
+
+############################     LOGIC + FLOW     ##############################
+
+################################################################################
+exit 0
+
