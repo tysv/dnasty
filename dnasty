@@ -1,13 +1,17 @@
 #!/bin/env bash
 
-debugflag=true; first_time_setup=""
+debugflag=true
 scriptname="$(basename "$0")"
-clientdir="$HOME/server" #the host files the device pulls from auth servers
-serverdir="$HOME/server" #the host files the device has auth over
+clientdir="$HOME" #the host files the device pulls from auth servers
+serverdir="$HOME" #the host files the device has auth over
+
+clientdir="$tmp/" #DELET EME DELETE ME TESTING OVERWRITE
+serverdir="$clientdir" # DLEETE ME DELETE ME DELETE ME
+
 logdir="$HOME/logs"
-logfile="${configdir}log"
-if [ -n "$first_time_setup" ]; then 
-	mkdir --parents "$configdir" && touch "$configfile"; 
+logfile="${logdir}/dnasty_log"
+if [ "$1" == "first time setup" ]; then
+	#mkdir --parents "$configdir" && touch "$configfile";
 	mkdir --parents "$logdir" && touch "$logfile";
 fi
 
@@ -16,7 +20,7 @@ fi
 exiting () { echo "exiting from $scriptname"; }
 trap 'exiting' EXIT ERR
 logger () { printf "%s\n" "$@" >> "$logfile"; }
-debug () { if [ "$debugflag" = "true" ]; then echo "$*"; fi; }
+debug () { if [ "$debugflag" = "true" ]; then echo "DEBUG: $*"; fi; }
 error () { printf "error:$0: %s\n" "$1"; exit "${2:-1}"; }
 print_help_text () { printf "%s\n" "\
 $(strbuilts --center "\
@@ -28,6 +32,7 @@ $(strbuilts --line)
 }
 #if you are the root authority for any *.hosts file, we prepare the files
 update_auth_lists () {
+	cd "$serverdir"
 	filelist="$(find -type f -name '*.auth')"
 	for file in "${filelist[@]}"; do [ -f "$file" ] || continue
 		x="$(cat "$file")"
@@ -41,7 +46,7 @@ update_auth_lists () {
 proceed_check () { #N=return1 Y=Return0 Q=Exit0
 	messages=();	while [ "$1" ]; do messages+=("$1"); shift; done
 	printf "%s\n" "${messages[@]}"
-	while true; do read -rp 'Proceed? (y/n/q):> ' choice; c="${choice[*]:0:1}"
+	while true; do read -rp '  Proceed? (y/n/q):> ' choice; c="${choice[*]:0:1}"
 		case "$c" in y|Y) return 0; ;; n|N) return 1; ;; q|Q) exit 0; ;; esac
 	done
 }
@@ -101,61 +106,98 @@ pull_remote_file () {
 	debug "trying scp... user=$user address=$address filename=$filename"
 	scp "$user@$address:/home/tsv/dnasty/$filename" ./
 }
+
 try_ping () { [ "$1" ] || error "provide IP address."
-	ping -c2 -W .5 "$1" 1>&2 > /dev/null; return "$?"
+	ping -q -c2 -W .5 "$1" 2>&1 >/dev/null; return "$?"
 }
-pull_root_servers () {
+pull_root_servers () { #why not allow passing non-standard auth files?
+	cd "$clientdir" #when pulling, we are always acting as client
+	while [ -f "$1" ]; do files+=($1); shift; done
 	files=($(find . -name '*.auth'))
 	new_files=()
 	for file in "${files[@]}"; do
 		network="$(basename ${file%.*})"
 		address="$(cat "$file")"
-		try_ping "$address" || { logger "failed ping: $network" && continue; }
+		try_ping "$address" || { logger "prs() Failed ping: $network" && continue; }
 		pull_remote_file "$address" "$network.checksum"
-		[ ! "$?" -eq 0 ] && { logger "failed checksum pull: $network" && continue; }
+		[ ! "$?" -eq 0 ] && { logger "prs() Failed checksum pull: $network" && continue; }
 		md5sum "$network.checksum" --check --quiet 1>&2 > /dev/null && continue
 		[ -f "$network.hosts" ] && localcopy "$network.hosts" 
 		pull_remote_file "$address" "$network.hosts"
-		logger "New host file pulled for networkID: $network"
+		logger "prs() New host file pulled for networkID: $network"
 	done
 }
-import_dnasty_configuration () { 
-	echo "unimplemented, but basically:"
-	echo "give a file perfect for calling declare on??? probably?"
+pull_install_files () {
+	[ -d "./dnasty-install-files" ] && return 0
+	user="${1:-guest}"		   # sftp jail user
+	address="${2:-10.0.5.2}" #hws default sftp for now.
+	proceed_check "((pw hint: flatulence vehicle))" \
+	"sftp attempt will look like: 'sftp ${user}@${address}'"
+	if [ "$?" -eq 1 ]; then 
+		read -p "user? " user && read -p "address? " address && \
+			pull_install_files "$user" "$address"
+		return "$?"
+	fi
+	try_ping "$address" || error "canont ping sftp address"
+	echo "1) CD downloads 2) GET dir \"dnasty-install-files\""
+	sftp "$user@$address"
+	[ -d "./dnasty-install-files" ] && return 0
+	return 1
 }
-install_dnasty () { [ -f "$1" ] && { import_dnasty_configuration; exit 1; }
-	#get sudo
-	#check for user dnasty, and prompt to start over if present already
-	#create CLIENT and SERVER folders in home directory
-	#copy this script into the home directory
-	#prompt for client or server installation
-
-	#CLIENT_MODE specific steps
-	#SERVER_MODE specific steps
+install_dnasty () {
+	#if install files locally, proceed else prompt for sftp credentials
+	pull_install_files || error "failed to retrieve install files"
 	
-	#unsorted
-	#create cronjob for PULLing auth scripts from other computers
-	#create cronjob for UPDATing .host files when we are AUTH SERVERS
-	#create example files for both: fake.hosts, fake.auth, fake.checksum
-	#create readme files for both??
+	[ $(whoami) = root ] || { exec su -c "$0 $@" root; exit 0; }	
+		## TODo bail out if automatic configuration provided	:
+		## [ -f "$1" ] && { import_dnasty_configuration; exit 1; }
+	#check for user dnasty, and prompt to start over if present already
+	if ! id "dnasty" >/dev/null 2>&1; then
+		proceed_check 'Previous installation detected!! \
+		Proceeding will destroy all files in the dnasty user home directory.' \
+		|| exit 0
+	fi
+	#create dnasty user
+	useradd dnasty --home-dir /home/dnasty --skel /dev/null --shell /bin/bash
+	#create CLIENT and SERVER folders in home directory
+	mkdir /home/dnasty/{server,client}
+	### copy this script into the home directory
+	cp "$0"  /home/dnasty/dnasty
+	### copy over the example files
+	#cp "fakefiles*" /home/dnasty/
+	#cp ./README.txt /home/dnasty/
+	#prompt for client or server installation     ## CAN BE BOTH ##
+	if [ "$installation_mode" = "client" ]; then echo "client install"
+		#CLIENT_MODE specific steps
+		#create cronjob for PULLing auth scripts from other computers
+	fi
+	if [ "$installation_mode" = "server" ]; then echo "server install"
+		#SERVER_MODE specific steps
+		#create cronjob for UPDATing .host files when we are AUTH SERVERS
+	fi
+	
 	#configure ssh to allow ssh-copy-id, or sftp jail?? to allow passwd auth on upload
-	#
+	# ??? 
+	# ???
 }
-
-
-
+uninstall_dnasty () {
+	echo "very next level gotta do install first obvi"
+	return 0
+	deluser --remove-all-files --backup
+}
+install_dnasty
 #########################     option parsing     ###############################
 
-#this is awoken by a cronjob, or manually run i suppose
-pull_root_servers
-
-exit 0
 shopt -s nocasematch; positionals=()
 while [ -n "$1" ]; do
 	case "$1" in
-		--help|-h) print_help_texts; ;;
+		--help|-h) print_help_text; ;;
+		--mode|-m) 
+			[ "$1" = "server" -o "$1" = "client" ] && installation_mode="$1" 
+			shift
+		;;
 		--update-auth-lists|-u|--update) update_auth_lists; ;;
-		--pull-auth-lists|-p|--pull) pull_root_servers
+		--pull-auth-lists|-p|--pull) pull_root_servers; ;;
 		--install|-i|--setup) install_dnasty; ;;
 		*) positionals+=("$1"); ;;
 	esac
