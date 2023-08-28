@@ -1,24 +1,21 @@
 #!/bin/env bash
 
 debugflag=true
-scriptname="$(basename "$0")"
-clientdir="$HOME" #the host files the device pulls from auth servers
-serverdir="$HOME" #the host files the device has auth over
+#scriptname="$(basename "$0")"
+scriptname="dnasty"
+AGENT_HOME="/home/$scriptname"
+clientdir="$AGENT_HOME" #the host files the device pulls from auth servers
+serverdir="$AGENT_HOME" #the host files the device has auth over
+parameters="$*"
+hosts_file="dnasty_master_hosts" # /ETC/HOSTS
 
-clientdir="$tmp/" #DELET EME DELETE ME TESTING OVERWRITE
-serverdir="$clientdir" # DLEETE ME DELETE ME DELETE ME
-
-logdir="$HOME/logs"
-logfile="${logdir}/dnasty_log"
-if [ "$1" == "first time setup" ]; then
-	#mkdir --parents "$configdir" && touch "$configfile";
-	mkdir --parents "$logdir" && touch "$logfile";
-fi
+logdir="$AGENT_HOME/logs"
+logfile="${logdir}/"$scriptname"_log"
 
 #########################   utility functions   ################################
 
-exiting () { echo "exiting from $scriptname"; }
-trap 'exiting' EXIT ERR
+#exiting_function () { false; } #sometimes does something;
+#trap 'exiting_function' EXIT ERR
 logger () { printf "%s\n" "$@" >> "$logfile"; }
 debug () { if [ "$debugflag" = "true" ]; then echo "DEBUG: $*"; fi; }
 error () { printf "error:$0: %s\n" "$1"; exit "${2:-1}"; }
@@ -26,22 +23,13 @@ print_help_text () { printf "%s\n" "\
 $(strbuilts --center "\
 $scriptname USAGE: $scriptname <-(-o)ptions> <args>")
 Options include:
-	-(-h)elp	will print this text
+	-(-h)elp		will print this text
+	--install		interactive: creates dnastty user, prompts sftp session
+	--uninstall		destroys dnasty user, removes dnasty systemfiles
+	--cron-server	ran by daemon to update our checksums
+	--cron-client	ran by daemon to update our /etc/hosts file
 $(strbuilts --line)
 "
-}
-#if you are the root authority for any *.hosts file, we prepare the files
-update_auth_lists () {
-	cd "$serverdir"
-	filelist="$(find -type f -name '*.auth')"
-	for file in "${filelist[@]}"; do [ -f "$file" ] || continue
-		x="$(cat "$file")"
-		[ "$x" = "localhost" -o "$x" = "127.0.0.1" ] || continue
-		netID="$(basename ${file%.*})" 		#gets rid of file suffix
-	#	netID="${netID//*\/}"	#gets rid of any lingering filepath
-		localcopy "$netID.hosts" 1>&2> /dev/null
-		md5sum "$file" > "$netID.checksum"
-	done
 }
 proceed_check () { #N=return1 Y=Return0 Q=Exit0
 	messages=();	while [ "$1" ]; do messages+=("$1"); shift; done
@@ -54,10 +42,6 @@ proceed_check () { #N=return1 Y=Return0 Q=Exit0
 ########################        FUNCTIONS        ###############################
 localcopy () { # version modified from .bash_functions 8/11/23
     shopt -s dotglob; shopt -s nullglob; dir="$PWD"
-    if [ "$1" = "--dir" -o "$1" = "-d" ]; then
-        directory="$(realpath $2)";
-        [ -d "$directory" ] && { dir="$directory"; shift 2; } || return 1;
-    fi
     for file in "$@"; do
         if [ -f "$file" ]; then
             if [ "${file[@]:0:1}" = '.' ]; then optionalDot=''
@@ -75,117 +59,181 @@ localcopy () { # version modified from .bash_functions 8/11/23
             done
             diff -qN "${copyname}$last_suffix" "$file" 1>&2 > /dev/null
             if [ "$?" -eq 0 ]; then return 0
-            else cp -i "$file" "${copyname}$suffix"
+            else cp -i "$file" "${copyname}$suffix" || error "localcopy()"
             fi
         fi
     done
+    shopt -u dotglob; shopt -u nullglob
 }
+try_ping () { [ "$1" ] || error "provide IP address."
+	ping -q -c2 -W .5 "$1" 2>&1 >/dev/null; return "$?"
+}
+confirm_root () { [ $(whoami) = root ] || \
+{ echo "requires ROOT!"; exec su -c "$0 ${@:-$parameters}" root; exit 0; }	
+}
+
+
+#########################     CLIENT FUNCTIONS      ############################
 #concatonates current .hosts into a unified /etc/hosts format file and prints filename
 create_host_file () {
+	cd $AGENT_HOME || exit 111
 	result="new_$(date +%s).conf"
 	touch "$result"
-	[ -d "$1" ] || error "create_host_file(): \$1 must equal valid dirname."
 	files=($(find . -name '*.hosts'))
 	for file in "${files[@]}"; do
 		network="$(basename ${file%.*})"
 		echo "# $network-hosts:" >> "$result"
 		cat "$file" >> "$result"
-		echo $'\n' >> "$result"
+		echo >> "$result"
 	done
-	printf "%s" "$(realpath $result)"
+	printf "%s" "$result"
 }
+#pull from the remote dnasty-agent
 pull_remote_filetype () {
 	[ "$#" -ge 2 -a "$#" -le 3 ] || error "ARGS: target IP, download suffix, (whereto save)"
-	user="dnasty"; address="$1"; suffix="$2"; save_to="${3:-./}"
+	user="$scriptname"; address="$1"; suffix="$2"; save_to="${3:-./}"
 	scp "$user@$address":'*.'"$suffix" ./
 }
-pull_remote_file () {
+#pull from the remote dnasty-agent
+pull_remote_file () { 
 	[ "$#" -eq 2 ] || error "ARGS: target IP & target FILENAME (& whereto SAVE)"
 	user="tsv"; address="$1"; filename="$2"; save_to="${3:-./}"
 	#scp "$user@$address:$filename" #assume flat dnasty folder
 	debug "trying scp... user=$user address=$address filename=$filename"
-	scp "$user@$address:/home/tsv/dnasty/$filename" ./
+	scp "$user@$address:$AGENT_HOME/$filename" ./
 }
-
-try_ping () { [ "$1" ] || error "provide IP address."
-	ping -q -c2 -W .5 "$1" 2>&1 >/dev/null; return "$?"
-}
-pull_root_servers () { #why not allow passing non-standard auth files?
-	cd "$clientdir" #when pulling, we are always acting as client
-	while [ -f "$1" ]; do files+=($1); shift; done
+pull_root_servers () {
+	update_status=1 #returning, thus 1 instead of "false"
+	cd "$clientdir" || exit 111 #when pulling, we are always acting as client
 	files=($(find . -name '*.auth'))
-	new_files=()
 	for file in "${files[@]}"; do
-		network="$(basename ${file%.*})"
+		network="$(basename ${file%.*})" #networkID stored in filename
 		address="$(cat "$file")"
-		try_ping "$address" || { logger "prs() Failed ping: $network" && continue; }
+		try_ping "$address" || { logger "prs() FAILed ping: $network" && continue; }
 		pull_remote_file "$address" "$network.checksum"
-		[ ! "$?" -eq 0 ] && { logger "prs() Failed checksum pull: $network" && continue; }
+		[ "$?" -eq 0 ] || { logger "prs() FAILed file.checksum pull: $network" && continue; }
 		md5sum "$network.checksum" --check --quiet 1>&2 > /dev/null && continue
 		[ -f "$network.hosts" ] && localcopy "$network.hosts" 
 		pull_remote_file "$address" "$network.hosts"
-		logger "prs() New host file pulled for networkID: $network"
+		[ "$?" -eq 0 ] || { logger "prs() FAILed file.hosts pull: $network" && continue; } 
+		logger "prs() NEW host file pulled for networkID: $network"
+		update_status=0
+	done
+	return "$update_status"
+}
+cron_client () {
+	[ $(whoami) = root ] || error "cronjob must be run by root. exiting."
+	cd $AGENT_HOME || exit 111
+	
+	pull_root_servers
+	create_host_file
+	update_hosts_file
+}
+
+cron_all () { echo "cron_all ran! $(date)" >> "$AGENT_HOME/cronall.log"; }
+
+
+#########################     SERVER FUNCTIONS      ############################
+
+#if you are the root authority for any *.hosts file, we prepare the files
+update_auth_lists () {
+	cd "$serverdir" || exit 111
+	filelist="$(find -type f -name '*.auth')"
+	for file in "${filelist[@]}"; do [ -f "$file" ] || continue
+		x="$(cat "$file")"
+		[ "$x" = "localhost" -o "$x" = "127.0.0.1" ] || continue
+		netID="$(basename ${file%.*})" 		#gets rid of file suffix
+	#	netID="${netID//*\/}"	#gets rid of any lingering filepath
+		localcopy "$netID.hosts" 1>&2> /dev/null
+		md5sum "$file" > "$netID.checksum"
 	done
 }
+cron_server () {
+	[ $(whoami) = root ] || error "cronjob must be run by root. exiting."
+	echo "todo: cron_server()" && exit 0
+	update_auth_lists
+	create_host_file
+	update_hosts_file
+}
+
+#########################     INSTALL FUNCTIONS      ###########################
 pull_install_files () {
-	[ -d "./dnasty-install-files" ] && return 0
+	cd "$AGENT_HOME" || exit 111
+	[ -d "./$scriptname-install-files" ] && return 0
 	user="${1:-guest}"		   # sftp jail user
 	address="${2:-10.0.5.2}" #hws default sftp for now.
-	proceed_check "((pw hint: flatulence vehicle))" \
-	"sftp attempt will look like: 'sftp ${user}@${address}'"
+	proceed_check "sftp attempt will look like: 'sftp ${user}@${address}'" \
+	"			(Say (n)o to change values)"
 	if [ "$?" -eq 1 ]; then 
 		read -p "user? " user && read -p "address? " address && \
 			pull_install_files "$user" "$address"
 		return "$?"
 	fi
-	try_ping "$address" || error "canont ping sftp address"
-	echo "1) CD downloads 2) GET dir \"dnasty-install-files\""
+	try_ping "$address" || error "cannot ping sftp address"
+	echo 'COMMANDS: 1)"cd download" 2)"get -r dnasty-install-files" 3) "exit"'
+	echo "((pw hint: flatulence vehicle))"
 	sftp "$user@$address"
-	[ -d "./dnasty-install-files" ] && return 0
+	[ -d "./$scriptname-install-files" ] && return 0
 	return 1
 }
 install_dnasty () {
+	proceed_check "INSTALLING DNASTY ON YOUR DEVICE. THIS IS DANGEROUS." || exit
 	#if install files locally, proceed else prompt for sftp credentials
-	pull_install_files || error "failed to retrieve install files"
-	
-	[ $(whoami) = root ] || { exec su -c "$0 $@" root; exit 0; }	
-		## TODo bail out if automatic configuration provided	:
+	confirm_root
+		## todo:: bail out if automatic configuration provided	:
 		## [ -f "$1" ] && { import_dnasty_configuration; exit 1; }
 	#check for user dnasty, and prompt to start over if present already
-	if ! id "dnasty" >/dev/null 2>&1; then
-		proceed_check 'Previous installation detected!! \
+	id "$scriptname" &> /dev/null && {
+		proceed_check 'Previous installation detected!!
 		Proceeding will destroy all files in the dnasty user home directory.' \
-		|| exit 0
-	fi
+		|| exit 0; 
+		uninstall_dnasty
+		}
 	#create dnasty user
-	useradd dnasty --home-dir /home/dnasty --skel /dev/null --shell /bin/bash
+	#echo "whoops" && exit 0
+	useradd "$scriptname" --home-dir $AGENT_HOME -m --skel /dev/null --shell /bin/bash
+	cd "$AGENT_HOME" || error '$AGENT_HOME missing; failed install.'
+	pull_install_files || error "failed to retrieve install files"
 	#create CLIENT and SERVER folders in home directory
-	mkdir /home/dnasty/{server,client}
-	### copy this script into the home directory
-	cp "$0"  /home/dnasty/dnasty
+	mkdir --parents $AGENT_HOME/{server,client,.ssh} || exit 111
+	ssh-keygen -f $AGENT_HOME/.ssh/${HOSTNAME}_key -N || echo "failed keygen"
 	### copy over the example files
-	#cp "fakefiles*" /home/dnasty/
-	#cp ./README.txt /home/dnasty/
-	#prompt for client or server installation     ## CAN BE BOTH ##
-	if [ "$installation_mode" = "client" ]; then echo "client install"
-		#CLIENT_MODE specific steps
-		#create cronjob for PULLing auth scripts from other computers
-	fi
-	if [ "$installation_mode" = "server" ]; then echo "server install"
-		#SERVER_MODE specific steps
-		#create cronjob for UPDATing .host files when we are AUTH SERVERS
-	fi
+	cp "./**/example*" $AGENT_HOME/
+	cp "./**/README.txt" $AGENT_HOME/
+	### copy this script into the home directory
+	cp "$0"  $AGENT_HOME/"$scriptname"
+	#preserve the existing /etc/hosts file found during install
+	cp /etc/hosts $AGENT_HOME/existing-etc-hosts.hosts
+	echo "localhost" > existing-etc-hosts.auth
 	
-	#configure ssh to allow ssh-copy-id, or sftp jail?? to allow passwd auth on upload
-	# ??? 
+	#CLIENT_MODE specific steps
+	#create cronjob for PULLing auth scripts from other computers
+	#SERVER_MODE specific steps
+	#create cronjob for UPDATing .hosts files when we are AUTH SERVERS
+
+	echo "todo: ssh w/ssh-copy-id; or sftp jail? to allow passwd auth on upload"
+	# 
 	# ???
 }
 uninstall_dnasty () {
-	echo "very next level gotta do install first obvi"
-	return 0
-	deluser --remove-all-files --backup
+	if id "$scriptname" &> /dev/null; then
+		confirm_root
+		deluser --remove-home --backup-to "/tmp" dnasty
+		echo 'TODO!! remove the files outside home like systemd timers etc'
+	else error "uninstall(): dnasty user not detected; cannot delete"
+	fi
 }
-install_dnasty
+
+#########################     ##############     ###############################
+
+update_hosts_file () {
+	[ -f "$1" ] || error "update_hosts_file() requires filepath to new hostfile."
+	[ -f "$hosts_file" ] && \
+		{ localcopy "$hosts_file" || error "FAILed to backup hosts_file."; }
+	cp "$1" --force "$hosts_file" || error "FAILed to overwrite hosts_file."
+	echo ">>cp "$hosts_file" --force /etc/hosts || error 'FAILed to replace /etc/hosts'"
+}
+
 #########################     option parsing     ###############################
 
 shopt -s nocasematch; positionals=()
@@ -199,6 +247,13 @@ while [ -n "$1" ]; do
 		--update-auth-lists|-u|--update) update_auth_lists; ;;
 		--pull-auth-lists|-p|--pull) pull_root_servers; ;;
 		--install|-i|--setup) install_dnasty; ;;
+		--uninstall|--remove) 
+			proceed_check "DELETING ALL FILES IN $AGENT_HOME AND DELETING USER"
+			if [ "$?" = 0 ]; then uninstall_dnasty; fi 
+		;;
+		--cron-client|--cronjob-client|--cc) cron_client; ;;
+		--cron-server|--cronjob-server|--cs) cron_server; ;;
+		--cron-all|--cronjob-all|--ca)		 cron_all; ;;
 		*) positionals+=("$1"); ;;
 	esac
 	shift
